@@ -20,6 +20,7 @@ func TestAccAzureRMLinuxVirtualMachineScaleSet_authPassword(t *testing.T) {
 				Config: testAccAzureRMLinuxVirtualMachineScaleSet_authPassword(data),
 				Check: resource.ComposeTestCheckFunc(
 					testCheckAzureRMLinuxVirtualMachineScaleSetExists(data.ResourceName),
+					resource.TestCheckResourceAttrSet(data.ResourceName, "virtual_machine_id"),
 				),
 			},
 			data.ImportStep(
