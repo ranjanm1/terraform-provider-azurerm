@@ -9,6 +9,63 @@ import (
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/utils"
 )
 
+func bootDiagnosticsSchema() *schema.Schema {
+	return &schema.Schema{
+		Type:     schema.TypeList,
+		Optional: true,
+		MaxItems: 1,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				// TODO: should this be `storage_account_endpoint`?
+				"storage_account_uri": {
+					Type:     schema.TypeString,
+					Required: true,
+					// TODO: validation
+				},
+			},
+		},
+	}
+}
+
+func expandBootDiagnostics(input []interface{}) *compute.DiagnosticsProfile {
+	if len(input) == 0 {
+		return &compute.DiagnosticsProfile{
+			BootDiagnostics: &compute.BootDiagnostics{
+				Enabled:    utils.Bool(false),
+				StorageURI: utils.String(""),
+			},
+		}
+	}
+
+	raw := input[0].(map[string]interface{})
+
+	storageAccountURI := raw["storage_account_uri"].(string)
+
+	return &compute.DiagnosticsProfile{
+		BootDiagnostics: &compute.BootDiagnostics{
+			Enabled:    utils.Bool(true),
+			StorageURI: utils.String(storageAccountURI),
+		},
+	}
+}
+
+func flattenBootDiagnostics(input *compute.DiagnosticsProfile) []interface{} {
+	if input == nil || input.BootDiagnostics == nil || input.BootDiagnostics.Enabled == nil || !*input.BootDiagnostics.Enabled {
+		return []interface{}{}
+	}
+
+	storageAccountUri := ""
+	if input.BootDiagnostics.StorageURI != nil {
+		storageAccountUri = *input.BootDiagnostics.StorageURI
+	}
+
+	return []interface{}{
+		map[string]interface{}{
+			"storage_account_uri": storageAccountUri,
+		},
+	}
+}
+
 func linuxSecretSchema() *schema.Schema {
 	return &schema.Schema{
 		Type:     schema.TypeList,

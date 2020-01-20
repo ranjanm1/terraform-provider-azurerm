@@ -7,6 +7,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-07-01/compute"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/validation"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/helpers/azure"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/helpers/tf"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/helpers/validate"
@@ -14,10 +15,13 @@ import (
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/internal/features"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/internal/locks"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/internal/tags"
+	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/internal/tf/base64"
 	azSchema "github.com/terraform-providers/terraform-provider-azurerm/azurerm/internal/tf/schema"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/internal/timeouts"
 	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/utils"
 )
+
+// TODO: locking as appropriate
 
 func resourceLinuxVirtualMachine() *schema.Resource {
 	return &schema.Resource{
@@ -28,14 +32,15 @@ func resourceLinuxVirtualMachine() *schema.Resource {
 		Importer: azSchema.ValidateResourceIDPriorToImport(func(id string) error {
 			_, err := ParseVirtualMachineID(id)
 			// TODO: confirm prior to the Beta that this is a Linux VM
+			// TODO: confirm that the OS Disk isn't "attach"
 			return err
 		}),
 
 		Timeouts: &schema.ResourceTimeout{
-			Create: schema.DefaultTimeout(30 * time.Minute),
+			Create: schema.DefaultTimeout(45 * time.Minute),
 			Read:   schema.DefaultTimeout(5 * time.Minute),
-			Update: schema.DefaultTimeout(30 * time.Minute),
-			Delete: schema.DefaultTimeout(30 * time.Minute),
+			Update: schema.DefaultTimeout(45 * time.Minute),
+			Delete: schema.DefaultTimeout(45 * time.Minute),
 		},
 
 		Schema: map[string]*schema.Schema{
@@ -77,6 +82,8 @@ func resourceLinuxVirtualMachine() *schema.Resource {
 			},
 
 			// Optional
+			"additional_capabilities": virtualMachineAdditionalCapabilitiesSchema(),
+
 			"admin_password": {
 				Type:      schema.TypeString,
 				Optional:  true,
@@ -89,9 +96,24 @@ func resourceLinuxVirtualMachine() *schema.Resource {
 			"allow_extension_operations": {
 				Type:     schema.TypeBool,
 				Optional: true,
-				ForceNew: true, // TODO: confirm
+				ForceNew: true, // TODO: confirm behaviour
 				Default:  true,
 			},
+
+			"availability_set_id": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+				// TODO: it'd be nice to add more granular validation here
+				ValidateFunc: azure.ValidateResourceID,
+				// TODO: confirm if the casing is also broken for this API
+				ConflictsWith: []string{
+					// TODO: "virtual_machine_scale_set_id"
+					"zone",
+				},
+			},
+
+			"boot_diagnostics": bootDiagnosticsSchema(),
 
 			"computer_name": {
 				Type:     schema.TypeString,
@@ -105,10 +127,24 @@ func resourceLinuxVirtualMachine() *schema.Resource {
 				ValidateFunc: ValidateLinuxName,
 			},
 
+			"custom_data": base64.OptionalSchema(),
+
 			"disable_password_authentication": {
 				Type:     schema.TypeBool,
 				Optional: true,
 				Default:  true,
+			},
+
+			"priority": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+				Default:  string(compute.Regular),
+				ValidateFunc: validation.StringInSlice([]string{
+					string(compute.Low), // TODO: remove me
+					string(compute.Regular),
+					// TODO: spot
+				}, false),
 			},
 
 			"provision_vm_agent": {
@@ -117,6 +153,19 @@ func resourceLinuxVirtualMachine() *schema.Resource {
 				Default:  true,
 				ForceNew: true,
 			},
+
+			"proximity_placement_group_id": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+				// TODO: it'd be nice to add more granular validation here
+				ValidateFunc: azure.ValidateResourceID,
+				// TODO: confirm if also the case for the VM API
+				// the Compute API is broken and returns the Resource Group name in UPPERCASE :shrug:
+				//DiffSuppressFunc: suppress.CaseDifference,
+			},
+
+			"secret": linuxSecretSchema(),
 
 			"source_image_id": {
 				Type:         schema.TypeString,
@@ -128,8 +177,44 @@ func resourceLinuxVirtualMachine() *schema.Resource {
 
 			"tags": tags.Schema(),
 
+			"zone": {
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+				ConflictsWith: []string{
+					// TODO: confirm is this right?
+					"availability_set_id",
+					// TODO: "virtual_machine_scale_set_id"
+				},
+			},
+
 			// Computed
-			// vm_id, private_ip_address, public_ip_address, private_ip_addresses, public_ip_addresses?
+			"private_ip_address": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"private_ip_addresses": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+			"public_ip_address": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"public_ip_addresses": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+			},
+			"virtual_machine_id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
 		},
 	}
 }
@@ -158,8 +243,13 @@ func resourceLinuxVirtualMachineCreate(d *schema.ResourceData, meta interface{})
 		}
 	}
 
+	additionalCapabilitiesRaw := d.Get("additional_capabilities").([]interface{})
+	additionalCapabilities := expandVirtualMachineAdditionalCapabilities(additionalCapabilitiesRaw)
+
 	adminUsername := d.Get("admin_username").(string)
 	allowExtensionOperations := d.Get("allow_extension_operations").(bool)
+	bootDiagnosticsRaw := d.Get("boot_diagnostics").([]interface{})
+	bootDiagnostics := expandBootDiagnostics(bootDiagnosticsRaw)
 	var computerName string
 	if v, ok := d.GetOk("computer_name"); ok && len(v.(string)) > 0 {
 		computerName = v.(string)
@@ -168,6 +258,7 @@ func resourceLinuxVirtualMachineCreate(d *schema.ResourceData, meta interface{})
 	}
 	disablePasswordAuthentication := d.Get("disable_password_authentication").(bool)
 	location := azure.NormalizeLocation(d.Get("location").(string))
+	priority := d.Get("priority").(string)
 	provisionVMAgent := d.Get("provision_vm_agent").(bool)
 	size := d.Get("size").(string)
 	t := d.Get("tags").(map[string]interface{})
@@ -178,11 +269,13 @@ func resourceLinuxVirtualMachineCreate(d *schema.ResourceData, meta interface{})
 	osDiskRaw := d.Get("os_disk").([]interface{})
 	osDisk := ExpandVirtualMachineOSDisk(osDiskRaw, compute.Linux)
 
+	secretsRaw := d.Get("secret").([]interface{})
+	secrets := expandLinuxSecrets(secretsRaw)
+
 	sourceImageReferenceRaw := d.Get("source_image_reference").([]interface{})
 	sourceImageId := d.Get("source_image_id").(string)
 	sourceImageReference, err := ExpandSourceImageReference(sourceImageReferenceRaw, sourceImageId)
 	if err != nil {
-		// TODO: is this still valid for VM's?
 		return err
 	}
 
@@ -198,8 +291,8 @@ func resourceLinuxVirtualMachineCreate(d *schema.ResourceData, meta interface{})
 			},
 			OsProfile: &compute.OSProfile{
 				AdminUsername:            utils.String(adminUsername),
-				AllowExtensionOperations: utils.Bool(allowExtensionOperations),
 				ComputerName:             utils.String(computerName),
+				AllowExtensionOperations: utils.Bool(allowExtensionOperations),
 				LinuxConfiguration: &compute.LinuxConfiguration{
 					DisablePasswordAuthentication: utils.Bool(disablePasswordAuthentication),
 					ProvisionVMAgent:              utils.Bool(provisionVMAgent),
@@ -207,14 +300,12 @@ func resourceLinuxVirtualMachineCreate(d *schema.ResourceData, meta interface{})
 						PublicKeys: &sshKeys,
 					},
 				},
-
-				// TODO: optional fields
-				//CustomData:                  nil,
-				//Secrets:                     nil,
+				Secrets: secrets,
 			},
 			NetworkProfile: &compute.NetworkProfile{
 				NetworkInterfaces: &networkInterfaceIds,
 			},
+			Priority: compute.VirtualMachinePriorityTypes(priority),
 			StorageProfile: &compute.StorageProfile{
 				ImageReference: sourceImageReference,
 				OsDisk:         osDisk,
@@ -225,18 +316,13 @@ func resourceLinuxVirtualMachineCreate(d *schema.ResourceData, meta interface{})
 			},
 
 			// Optional
-			//AdditionalCapabilities: nil,
-			//DiagnosticsProfile:     nil,
+			AdditionalCapabilities: additionalCapabilities,
+			DiagnosticsProfile:     bootDiagnostics,
 
-			// these two conflict
-			AvailabilitySet:        nil,
-			VirtualMachineScaleSet: nil,
+			// conflicts with availability set id
+			//VirtualMachineScaleSet: nil,
 
-			// Optional - proximity_placement_group_id
-			ProximityPlacementGroup: nil,
-
-			// Optional - `priority` - defaulted to Regular?
-			//Priority:       "Regular|Low",
+			// Optional
 			//BillingProfile: nil,
 			//EvictionPolicy: "",
 
@@ -250,14 +336,45 @@ func resourceLinuxVirtualMachineCreate(d *schema.ResourceData, meta interface{})
 		// TODO: optionally populated
 		//Identity:                 nil,
 		//Plan:                     nil,
-		//Zones:                    nil,
 	}
 
-	if adminPassword, ok := d.GetOk("admin_password"); ok {
-		params.OsProfile.AdminPassword = utils.String(adminPassword.(string))
+	if !provisionVMAgent && allowExtensionOperations {
+		return fmt.Errorf("`allow_extension_operations` cannot be set to `true` when `provision_vm_agent` is set to `false`")
 	}
 
-	// TODO: handle: Authentication using either SSH or by user name and password must be enabled in Linux profile." Target="linuxConfiguration"
+	if v, ok := d.GetOk("availability_set_id"); ok {
+		params.AvailabilitySet = &compute.SubResource{
+			ID: utils.String(v.(string)),
+		}
+	}
+
+	if v, ok := d.GetOk("custom_data"); ok {
+		params.OsProfile.CustomData = utils.String(v.(string))
+	}
+
+	if v, ok := d.GetOk("proximity_placement_group_id"); ok {
+		params.ProximityPlacementGroup = &compute.SubResource{
+			ID: utils.String(v.(string)),
+		}
+	}
+
+	if v, ok := d.GetOk("zone"); ok {
+		params.Zones = &[]string{
+			v.(string),
+		}
+	}
+
+	// "Authentication using either SSH or by user name and password must be enabled in Linux profile." Target="linuxConfiguration"
+	adminPassword := d.Get("admin_password").(string)
+	if disablePasswordAuthentication && len(sshKeys) == 0 {
+		return fmt.Errorf("At least one `admin_ssh_key` must be specified when `disable_password_authentication` is set to `true`")
+	} else if !disablePasswordAuthentication {
+		if adminPassword == "" {
+			return fmt.Errorf("An `admin_password` must be specified if `disable_password_authentication` is set to `false`")
+		}
+
+		params.OsProfile.AdminPassword = utils.String(adminPassword)
+	}
 
 	future, err := client.CreateOrUpdate(ctx, resourceGroup, name, params)
 	if err != nil {
@@ -278,6 +395,7 @@ func resourceLinuxVirtualMachineCreate(d *schema.ResourceData, meta interface{})
 	}
 
 	d.SetId(*read.ID)
+	setVirtualMachineConnectionInformation(d, read.VirtualMachineProperties)
 	return resourceLinuxVirtualMachineRead(d, meta)
 }
 
@@ -309,6 +427,20 @@ func resourceLinuxVirtualMachineRead(d *schema.ResourceData, meta interface{}) e
 	}
 
 	if props := resp.VirtualMachineProperties; props != nil {
+		if err := d.Set("additional_capabilities", flattenVirtualMachineAdditionalCapabilities(props.AdditionalCapabilities)); err != nil {
+			return fmt.Errorf("Error setting `additional_capabilities`: %+v", err)
+		}
+
+		availabilitySetId := ""
+		if props.AvailabilitySet != nil && props.AvailabilitySet.ID != nil {
+			availabilitySetId = *props.AvailabilitySet.ID
+		}
+		d.Set("availability_set_id", availabilitySetId)
+
+		if err := d.Set("boot_diagnostics", flattenBootDiagnostics(props.DiagnosticsProfile)); err != nil {
+			return fmt.Errorf("Error setting `boot_diagnostics`: %+v", err)
+		}
+
 		if profile := props.HardwareProfile; profile != nil {
 			d.Set("size", string(profile.VMSize))
 		}
@@ -318,6 +450,12 @@ func resourceLinuxVirtualMachineRead(d *schema.ResourceData, meta interface{}) e
 				return fmt.Errorf("Error setting `network_interface_ids`: %+v", err)
 			}
 		}
+
+		//dedicatedHostId := ""
+		//if props.Host != nil && props.Host.ID != nil {
+		//	dedicatedHostId = *props.Host.ID
+		//}
+		//d.Set("dedicated_host_id", dedicatedHostId)
 
 		if profile := props.OsProfile; profile != nil {
 			d.Set("admin_username", profile.AdminUsername)
@@ -336,7 +474,18 @@ func resourceLinuxVirtualMachineRead(d *schema.ResourceData, meta interface{}) e
 					return fmt.Errorf("Error setting `admin_ssh_key`: %+v", err)
 				}
 			}
+
+			if err := d.Set("secret", flattenLinuxSecrets(profile.Secrets)); err != nil {
+				return fmt.Errorf("Error setting `secret`: %+v", err)
+			}
 		}
+
+		d.Set("priority", string(props.Priority))
+		proximityPlacementGroupId := ""
+		if props.ProximityPlacementGroup != nil && props.ProximityPlacementGroup.ID != nil {
+			proximityPlacementGroupId = *props.ProximityPlacementGroup.ID
+		}
+		d.Set("proximity_placement_group_id", proximityPlacementGroupId)
 
 		if profile := props.StorageProfile; profile != nil {
 			if err := d.Set("os_disk", FlattenVirtualMachineOSDisk(profile.OsDisk)); err != nil {
@@ -354,16 +503,24 @@ func resourceLinuxVirtualMachineRead(d *schema.ResourceData, meta interface{}) e
 			}
 		}
 
-		//dedicatedHostId := ""
-		//if props.Host != nil && props.Host.ID != nil {
-		//	dedicatedHostId = *props.Host.ID
-		//}
-		//d.Set("dedicated_host_id", dedicatedHostId)
+		// Computed - TODO: implement me
+		d.Set("private_ip_address", "")
+		d.Set("private_ip_addresses", []interface{}{})
+		d.Set("public_ip_address", "")
+		d.Set("public_ip_addresses", []interface{}{})
+		d.Set("virtual_machine_id", props.VMID)
 
-		//d.Set("priority", string(props.Priority)
 	}
 
-	// TODO: ensure we set the connection information
+	zone := ""
+	if resp.Zones != nil {
+		if zones := *resp.Zones; len(zones) > 0 {
+			zone = zones[0]
+		}
+	}
+	d.Set("zone", zone)
+
+	setVirtualMachineConnectionInformation(d, resp.VirtualMachineProperties)
 
 	return tags.FlattenAndSet(d, resp.Tags)
 }
@@ -392,6 +549,8 @@ func resourceLinuxVirtualMachineUpdate(d *schema.ResourceData, meta interface{})
 	//	// client.Update(..)
 	//	log.Printf("[DEBUG] Updated the Network Interfaces for Virtual Machine %q (Resource Group %q).", id.Name, id.ResourceGroup)
 	//}
+
+	// setVirtualMachineConnectionInformation(d, read.VirtualMachineProperties)
 
 	return resourceLinuxVirtualMachineRead(d, meta)
 }
